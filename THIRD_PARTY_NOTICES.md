@@ -10,6 +10,11 @@ Reference: [TrayApp.cs, commit 2784e1b](https://github.com/portyporty/g435-batte
 
 The upstream license is reproduced below.
 
+The 046D:0ACB Realtek bridge is independently implemented from the documented
+PA/PI protocol and supplied packet captures. Additional protocol cross-checks:
+[deddroid/logitech-g435-battery](https://github.com/deddroid/logitech-g435-battery).
+No Rust implementation from that project is included in this repository.
+
 ---
 
 MIT License

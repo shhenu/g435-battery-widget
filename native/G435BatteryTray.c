@@ -9,6 +9,7 @@
 #include <cfgmgr32.h>
 #include <hidsdi.h>
 #include <hidpi.h>
+#include "g435_protocol.h"
 
 #define WM_TRAY (WM_APP + 1)
 #define WM_REFRESH (WM_APP + 2)
@@ -16,6 +17,9 @@
 #define TIMER_REFRESH 1
 #define MENU_REFRESH 1001
 #define MENU_EXIT 1002
+#define MENU_DIAGNOSTICS 1003
+#define TIMER_DEVICE_CHANGE 2
+#define APP_VERSION L"0.2.0"
 #define POLL_INTERVAL (15UL * 60UL * 1000UL)
 #define HID_REPORT_SIZE 65
 
@@ -26,6 +30,8 @@ typedef struct {
     BOOL ok;
     int millivolts;
     DWORD error;
+    int transport;
+    BOOL cleanupFailed;
 } BATTERY_RESULT;
 
 typedef CONFIGRET (WINAPI *CM_LIST_SIZE_FN)(PULONG, LPGUID, DEVINSTID_W, ULONG);
@@ -36,6 +42,8 @@ typedef BOOLEAN (__stdcall *HID_FREE_FN)(PHIDP_PREPARSED_DATA);
 typedef NTSTATUS (__stdcall *HID_CAPS_FN)(PHIDP_PREPARSED_DATA, PHIDP_CAPS);
 typedef BOOL (WINAPI *SHELL_NOTIFY_FN)(DWORD, PNOTIFYICONDATAW);
 typedef BOOL (WINAPI *DISABLE_IME_FN)(DWORD);
+typedef BOOLEAN (__stdcall *HID_FEATURE_FN)(HANDLE, PVOID, ULONG);
+typedef BOOLEAN (__stdcall *HID_PRODUCT_FN)(HANDLE, PVOID, ULONG);
 
 typedef struct {
     HANDLE device;
@@ -45,6 +53,14 @@ typedef struct {
     BOOL readPending;
     BOOL sessionStarted;
     BYTE sequence;
+    WORD inputLength;
+    WORD outputLength;
+    int transport;
+    int bridgeMethod;
+    HMODULE hidModule;
+    HID_FEATURE_FN feature;
+    HID_FEATURE_FN setFeature;
+    G435_PI_PARSER parser;
 } HID_SESSION;
 
 static const GUID kHidGuid = {
@@ -61,6 +77,10 @@ static HANDLE gWorker;
 static BOOL gExiting;
 static UINT gTaskbarCreated;
 static BATTERY_RESULT gResult;
+static HANDLE gDiagnosticOutput;
+static BOOL WriteConsoleText(const WCHAR *text);
+static DWORD PrintDiagnostics(void);
+static DWORD SaveDiagnosticReport(void);
 
 /* Explicit byte loops also keep compiler-generated CRT calls out of the binary. */
 static void ZeroBytes(void *data, SIZE_T count) {
@@ -100,6 +120,14 @@ static void AppendNumber(WCHAR *buffer, UINT capacity, UINT *used, DWORD number)
     UINT count = 0;
     do { reverse[count++] = (WCHAR)(L'0' + number % 10); number /= 10; } while (number);
     while (count && *used + 1 < capacity) buffer[(*used)++] = reverse[--count];
+    buffer[*used] = 0;
+}
+
+static void AppendHex(WCHAR *buffer, UINT capacity, UINT *used, DWORD number) {
+    static const WCHAR digits[] = L"0123456789ABCDEF";
+    int shift;
+    for (shift = 12; shift >= 0 && *used + 1 < capacity; shift -= 4)
+        buffer[(*used)++] = digits[(number >> shift) & 15];
     buffer[*used] = 0;
 }
 
@@ -157,22 +185,23 @@ static void CancelOperation(HANDLE device, OVERLAPPED *operation) {
 
 static BOOL BeginRead(HID_SESSION *session) {
     DWORD transferred;
+    if (session->inputLength == 0) return TRUE;
     ResetEvent(session->readOperation.hEvent);
-    if (!ReadFile(session->device, session->input, HID_REPORT_SIZE,
+    if (!ReadFile(session->device, session->input, session->inputLength,
                   &transferred, &session->readOperation)
         && GetLastError() != ERROR_IO_PENDING) return FALSE;
     session->readPending = TRUE;
     return TRUE;
 }
 
-static BOOL WritePacket(HID_SESSION *session, const BYTE packet[HID_REPORT_SIZE],
+static BOOL WritePacket(HID_SESSION *session, const BYTE *packet, DWORD length,
                         BOOL allowCancel) {
     DWORD transferred = 0;
     DWORD wait;
     HANDLE events[2];
     if (allowCancel && IsCancelled()) { SetLastError(ERROR_CANCELLED); return FALSE; }
     ResetEvent(session->writeOperation.hEvent);
-    if (!WriteFile(session->device, packet, HID_REPORT_SIZE,
+    if (!WriteFile(session->device, packet, length,
                    &transferred, &session->writeOperation)) {
         if (GetLastError() != ERROR_IO_PENDING) return FALSE;
         events[0] = session->writeOperation.hEvent;
@@ -186,7 +215,7 @@ static BOOL WritePacket(HID_SESSION *session, const BYTE packet[HID_REPORT_SIZE]
         if (!GetOverlappedResult(session->device, &session->writeOperation,
                                  &transferred, FALSE)) return FALSE;
     }
-    if (transferred != HID_REPORT_SIZE) { SetLastError(ERROR_WRITE_FAULT); return FALSE; }
+    if (transferred != length) { SetLastError(ERROR_WRITE_FAULT); return FALSE; }
     return TRUE;
 }
 
@@ -232,7 +261,8 @@ static BOOL Transact(HID_SESSION *session, BYTE command, const BYTE *body,
     BYTE output[HID_REPORT_SIZE];
     if (length > 60) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     MakeFrame(output, command, body, length);
-    return WritePacket(session, output, TRUE) && CollectReports(session, wait, millivolts);
+    return WritePacket(session, output, sizeof(output), TRUE)
+        && CollectReports(session, wait, millivolts);
 }
 
 static BOOL SendPa(HID_SESSION *session, BYTE category, BYTE lengthField,
@@ -249,7 +279,36 @@ static BOOL SendPa(HID_SESSION *session, BYTE category, BYTE lengthField,
     return Transact(session, 0x80, body, length + 5, wait, millivolts);
 }
 
-static HANDLE OpenDongle(void) {
+static void ReportInterface(const HIDD_ATTRIBUTES *attr, const HIDP_CAPS *caps,
+                            const WCHAR *product, int transport) {
+    WCHAR line[240];
+    UINT used = 0;
+    AppendWide(line, ARRAYSIZE(line), &used, L"VID=");
+    AppendHex(line, ARRAYSIZE(line), &used, attr->VendorID);
+    AppendWide(line, ARRAYSIZE(line), &used, L" PID=");
+    AppendHex(line, ARRAYSIZE(line), &used, attr->ProductID);
+    AppendWide(line, ARRAYSIZE(line), &used, L" revision=");
+    AppendHex(line, ARRAYSIZE(line), &used, attr->VersionNumber);
+    AppendWide(line, ARRAYSIZE(line), &used, L" usage=");
+    AppendHex(line, ARRAYSIZE(line), &used, caps->UsagePage);
+    AppendWide(line, ARRAYSIZE(line), &used, L" input=");
+    AppendNumber(line, ARRAYSIZE(line), &used, caps->InputReportByteLength);
+    AppendWide(line, ARRAYSIZE(line), &used, L" output=");
+    AppendNumber(line, ARRAYSIZE(line), &used, caps->OutputReportByteLength);
+    AppendWide(line, ARRAYSIZE(line), &used, L" feature=");
+    AppendNumber(line, ARRAYSIZE(line), &used, caps->FeatureReportByteLength);
+    AppendWide(line, ARRAYSIZE(line), &used, L" transport=");
+    AppendWide(line, ARRAYSIZE(line), &used,
+        transport == G435_TRANSPORT_CRC64 ? L"CRC64"
+        : transport == G435_TRANSPORT_BRIDGE6 ? L"BRIDGE6" : L"unsupported/non-control interface");
+    AppendWide(line, ARRAYSIZE(line), &used, L"\r\n  Product: ");
+    AppendWide(line, ARRAYSIZE(line), &used, product);
+    AppendWide(line, ARRAYSIZE(line), &used, L"\r\n");
+    WriteConsoleText(line);
+}
+
+/* Diagnostics uses metadata-only handles and never sends device commands. */
+static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose) {
     HMODULE config = NULL, hid = NULL;
     CM_LIST_SIZE_FN listSize;
     CM_LIST_FN list;
@@ -257,6 +316,9 @@ static HANDLE OpenDongle(void) {
     HID_PREPARSED_FN preparsed;
     HID_FREE_FN freePreparsed;
     HID_CAPS_FN capabilities;
+    HID_FEATURE_FN getFeature;
+    HID_FEATURE_FN setFeature;
+    HID_PRODUCT_FN getProduct;
     WCHAR *paths = NULL;
     HANDLE device = INVALID_HANDLE_VALUE;
     GUID guid;
@@ -264,6 +326,9 @@ static HANDLE OpenDongle(void) {
     ULONG characters = 0;
     UINT attempt;
     DWORD error = ERROR_NOT_FOUND;
+    DWORD openError = 0;
+    UINT seen = 0, supported = 0;
+    BOOL knownProduct = FALSE;
 
     config = LoadLibraryExW(L"cfgmgr32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!config) { error = GetLastError(); goto done; }
@@ -275,6 +340,9 @@ static HANDLE OpenDongle(void) {
     preparsed = (HID_PREPARSED_FN)GetProcAddress(hid, "HidD_GetPreparsedData");
     freePreparsed = (HID_FREE_FN)GetProcAddress(hid, "HidD_FreePreparsedData");
     capabilities = (HID_CAPS_FN)GetProcAddress(hid, "HidP_GetCaps");
+    getFeature = (HID_FEATURE_FN)GetProcAddress(hid, "HidD_GetFeature");
+    setFeature = (HID_FEATURE_FN)GetProcAddress(hid, "HidD_SetFeature");
+    getProduct = (HID_PRODUCT_FN)GetProcAddress(hid, "HidD_GetProductString");
     if (!listSize || !list || !attributes || !preparsed || !freePreparsed || !capabilities) {
         error = ERROR_PROC_NOT_FOUND;
         goto done;
@@ -282,7 +350,10 @@ static HANDLE OpenDongle(void) {
     CopyBytes(&guid, &kHidGuid, sizeof(guid));
     for (attempt = 0; attempt < 3; ++attempt) {
         if (listSize(&characters, &guid, NULL, CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
-            != CR_SUCCESS || characters < 2 || characters > 512 * 1024) goto done;
+            != CR_SUCCESS || characters < 2 || characters > 512 * 1024) {
+            error = ERROR_GEN_FAILURE;
+            goto done;
+        }
         paths = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                   (SIZE_T)characters * sizeof(WCHAR));
         if (!paths) { error = ERROR_NOT_ENOUGH_MEMORY; goto done; }
@@ -298,37 +369,198 @@ static HANDLE OpenDongle(void) {
             WCHAR *next = path;
             while (next < end && *next) ++next;
             if (next >= end) break;
-            if (ContainsAscii(path, L"vid_046d&pid_0adf")) {
-                HANDLE probe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+            if (diagnose || ContainsAscii(path, L"vid_046d")) {
+                HANDLE probe = CreateFileW(path, 0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                     FILE_FLAG_OVERLAPPED, NULL);
                 if (probe != INVALID_HANDLE_VALUE) {
                     HIDD_ATTRIBUTES attr;
                     PHIDP_PREPARSED_DATA data = NULL;
                     HIDP_CAPS caps;
+                    WCHAR product[96];
+                    int transport = G435_TRANSPORT_NONE;
                     ZeroBytes(&attr, sizeof(attr));
+                    ZeroBytes(&caps, sizeof(caps));
+                    ZeroBytes(product, sizeof(product));
                     attr.Size = sizeof(attr);
-                    if (attributes(probe, &attr) && attr.VendorID == 0x046d
-                        && attr.ProductID == 0x0adf && preparsed(probe, &data)) {
-                        BOOL matches = capabilities(data, &caps) == HIDP_STATUS_SUCCESS
-                            && caps.UsagePage == 0xff00
-                            && caps.InputReportByteLength == 65
-                            && caps.OutputReportByteLength == 65;
-                        freePreparsed(data);
-                        if (matches) { device = probe; break; }
+                    if (attributes(probe, &attr)) {
+                        if (getProduct && (diagnose || (attr.VendorID == 0x046d
+                            && attr.ProductID != 0x0adf && attr.ProductID != 0x0acb)))
+                            getProduct(probe, product, sizeof(product));
+                        product[ARRAYSIZE(product) - 1] = 0;
+                        if (preparsed(probe, &data)) {
+                            if (capabilities(data, &caps) == HIDP_STATUS_SUCCESS)
+                                transport = G435SelectTransport(attr.VendorID, attr.ProductID,
+                                    caps.UsagePage, caps.InputReportByteLength,
+                                    caps.OutputReportByteLength, caps.FeatureReportByteLength);
+                            freePreparsed(data);
+                        }
+                        if (attr.VendorID == 0x046d || ContainsAscii(product, L"G435")) {
+                            ++seen;
+                            if (diagnose) ReportInterface(&attr, &caps, product, transport);
+                        }
+                        if (ContainsAscii(product, L"G435") || (attr.VendorID == 0x046d
+                            && (attr.ProductID == 0x0adf || attr.ProductID == 0x0acb))) knownProduct = TRUE;
+                        if (transport != G435_TRANSPORT_NONE) {
+                            ++supported;
+                            if (!diagnose) {
+                                CloseHandle(probe);
+                                probe = INVALID_HANDLE_VALUE;
+                                device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                    FILE_FLAG_OVERLAPPED, NULL);
+                                if (device != INVALID_HANDLE_VALUE) {
+                                    session->inputLength = caps.InputReportByteLength;
+                                    session->outputLength = caps.OutputReportByteLength;
+                                    session->transport = transport;
+                                    session->feature = getFeature;
+                                    session->setFeature = setFeature;
+                                    session->hidModule = hid;
+                                    hid = NULL;
+                                    break;
+                                }
+                                openError = GetLastError();
+                            }
+                        }
                     }
-                    CloseHandle(probe);
-                } else error = GetLastError();
+                    if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+                } else if (ContainsAscii(path, L"vid_046d&pid_0adf")
+                           || ContainsAscii(path, L"vid_046d&pid_0acb")) openError = GetLastError();
             }
             path = next + 1;
         }
     }
+    if (status != CR_SUCCESS) error = ERROR_GEN_FAILURE;
+    else if (openError) error = openError;
+    else if (knownProduct) error = ERROR_NOT_SUPPORTED;
 done:
     if (paths) HeapFree(GetProcessHeap(), 0, paths);
     if (hid) FreeLibrary(hid);
     if (config) FreeLibrary(config);
+    if (diagnose) {
+        WCHAR summary[160];
+        UINT used = 0;
+        AppendWide(summary, ARRAYSIZE(summary), &used, L"\r\nRelevant interfaces: ");
+        AppendNumber(summary, ARRAYSIZE(summary), &used, seen);
+        AppendWide(summary, ARRAYSIZE(summary), &used, L"; supported control interfaces: ");
+        AppendNumber(summary, ARRAYSIZE(summary), &used, supported);
+        AppendWide(summary, ARRAYSIZE(summary), &used, L"\r\n");
+        if (!supported) {
+            AppendWide(summary, ARRAYSIZE(summary), &used, L"Discovery Windows error: ");
+            AppendNumber(summary, ARRAYSIZE(summary), &used, error);
+            AppendWide(summary, ARRAYSIZE(summary), &used, L"\r\n");
+        }
+        WriteConsoleText(summary);
+    }
     if (device == INVALID_HANDLE_VALUE) SetLastError(IsCancelled() ? ERROR_CANCELLED : error);
     return device;
+}
+
+static int TakeBridgeInput(HID_SESSION *session, BOOL *ack) {
+    DWORD length;
+    *ack = FALSE;
+    if (session->inputLength == 0) return 0;
+    if (!session->readPending && !BeginRead(session)) return -1;
+    if (WaitForSingleObject(session->readOperation.hEvent, 0) != WAIT_OBJECT_0) return 0;
+    session->readPending = FALSE;
+    if (!GetOverlappedResult(session->device, &session->readOperation, &length, FALSE)) return -1;
+    *ack = G435IsBridgeAck(session->input, length);
+    if (!BeginRead(session)) return -1;
+    return 1;
+}
+
+static int BridgeWrite(void *context, const G435_BYTE *packet, G435_UINT length, int allowCancel) {
+    HID_SESSION *session = (HID_SESSION *)context;
+    int count;
+    BOOL ack;
+    /* Do not mistake an ACK from an earlier command for the bridge-exit ACK. */
+    for (count = 0; count < 64; ++count) {
+        int ready = TakeBridgeInput(session, &ack);
+        if (ready < 0 && allowCancel) return 0;
+        if (ready <= 0) break;
+    }
+    if (allowCancel && IsCancelled()) { SetLastError(ERROR_CANCELLED); return 0; }
+    if (session->bridgeMethod == G435_BRIDGE_FEATURE64) {
+        BYTE feature[64];
+        if (!session->setFeature) { SetLastError(ERROR_PROC_NOT_FOUND); return 0; }
+        if (!G435BridgeFeaturePacket(feature, packet)) { SetLastError(ERROR_INVALID_DATA); return 0; }
+        return session->setFeature(session->device, feature, sizeof(feature));
+    }
+    if (session->outputLength != G435_BRIDGE_OUTPUT_SIZE) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    return WritePacket(session, packet, length, allowCancel);
+}
+
+static BOOL ReadBridgeFeature(HID_SESSION *session, BYTE report[64]) {
+    ZeroBytes(report, 64);
+    report[0] = 6;
+    return session->feature && session->feature(session->device, report, 64);
+}
+
+static int BridgeAck(void *context, int allowCancel) {
+    HID_SESSION *session = (HID_SESSION *)context;
+    DWORD started = GetTickCount();
+    HANDLE events[2];
+    events[0] = session->readOperation.hEvent;
+    events[1] = gCancel;
+    while (GetTickCount() - started < 1000) {
+        BYTE feature[64];
+        BOOL ack;
+        int ready;
+        if (allowCancel && IsCancelled()) { SetLastError(ERROR_CANCELLED); return 0; }
+        ready = TakeBridgeInput(session, &ack);
+        if (ready < 0) return 0;
+        if (ready > 0 && ack) return 1;
+        if (ReadBridgeFeature(session, feature)) {
+            if (G435IsBridgeAck(feature, sizeof(feature))) return 1;
+            if (session->bridgeMethod == G435_BRIDGE_FEATURE64)
+                G435FeedRawFeature(&session->parser, feature);
+            else G435FeedFeature(&session->parser, feature);
+        }
+        WaitForMultipleObjects(allowCancel ? 2 : 1, events, FALSE, 20);
+    }
+    SetLastError(ERROR_TIMEOUT);
+    return 0;
+}
+
+static int BridgeReply(void *context, int kind, int *value) {
+    HID_SESSION *session = (HID_SESSION *)context;
+    DWORD started = GetTickCount();
+    while (GetTickCount() - started < 2000) {
+        BYTE feature[64];
+        int reply;
+        if (IsCancelled()) { SetLastError(ERROR_CANCELLED); return 0; }
+        reply = G435TakeReply(&session->parser, kind, value);
+        if (reply > 0) { SetLastError(ERROR_SUCCESS); return 1; }
+        if (reply < 0) { SetLastError(ERROR_INVALID_DATA); return 0; }
+        if (ReadBridgeFeature(session, feature) && !(session->bridgeMethod == G435_BRIDGE_FEATURE64
+            ? G435FeedRawFeature(&session->parser, feature) : G435FeedFeature(&session->parser, feature))) {
+            SetLastError(ERROR_INVALID_DATA);
+            return 0;
+        }
+        if (WaitForSingleObject(gCancel, 10) == WAIT_OBJECT_0) {
+            SetLastError(ERROR_CANCELLED);
+            return 0;
+        }
+    }
+    SetLastError(ERROR_TIMEOUT);
+    return 0;
+}
+
+static int BridgePause(void *context, G435_UINT milliseconds) {
+    UNREFERENCED_PARAMETER(context);
+    if (WaitForSingleObject(gCancel, milliseconds) == WAIT_OBJECT_0) {
+        SetLastError(ERROR_CANCELLED);
+        return 0;
+    }
+    return 1;
+}
+
+static unsigned long BridgeError(void *context) {
+    UNREFERENCED_PARAMETER(context);
+    return GetLastError();
 }
 
 static BATTERY_RESULT ReadBattery(void) {
@@ -357,12 +589,40 @@ static BATTERY_RESULT ReadBattery(void) {
         return result;
     }
 
-    session.device = OpenDongle();
+    session.device = ScanDongles(&session, FALSE);
     if (session.device == INVALID_HANDLE_VALUE) { result.error = GetLastError(); goto done; }
+    result.transport = session.transport;
     session.readOperation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     session.writeOperation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!session.readOperation.hEvent || !session.writeOperation.hEvent || !BeginRead(&session)) {
         result.error = GetLastError();
+        goto done;
+    }
+    if (session.transport == G435_TRANSPORT_BRIDGE6) {
+        G435_BRIDGE_IO io;
+        G435_BRIDGE_RESULT bridge;
+        if (!session.feature) { result.error = ERROR_PROC_NOT_FOUND; goto done; }
+        io.context = &session;
+        io.write = BridgeWrite;
+        io.ack = BridgeAck;
+        io.reply = BridgeReply;
+        io.pause = BridgePause;
+        io.lastError = BridgeError;
+        session.bridgeMethod = session.setFeature ? G435_BRIDGE_FEATURE64 : G435_BRIDGE_OUTPUT515;
+        bridge = G435RunBridge(&io);
+        /* Never try another wire format until the previous bridge session is
+           confirmed closed, and never restart a cancelled request. */
+        if (!bridge.ok && bridge.cleanupSucceeded && !IsCancelled()
+            && session.bridgeMethod == G435_BRIDGE_FEATURE64
+            && session.outputLength == G435_BRIDGE_OUTPUT_SIZE) {
+            session.bridgeMethod = G435_BRIDGE_OUTPUT515;
+            session.parser.length = 0;
+            bridge = G435RunBridge(&io);
+        }
+        result.ok = bridge.ok;
+        result.millivolts = bridge.millivolts;
+        result.cleanupFailed = !bridge.cleanupSucceeded;
+        if (!bridge.ok) result.error = bridge.error ? bridge.error : ERROR_TIMEOUT;
         goto done;
     }
     session.sequence = 1;
@@ -386,13 +646,14 @@ done:
             BYTE output[HID_REPORT_SIZE];
             MakeFrame(output, 0x85, disable, 1);
             /* End the session even when a request was cancelled or failed. */
-            WritePacket(&session, output, FALSE);
+            WritePacket(&session, output, sizeof(output), FALSE);
         }
         if (session.readPending) CancelOperation(session.device, &session.readOperation);
         CloseHandle(session.device);
     }
     if (session.readOperation.hEvent) CloseHandle(session.readOperation.hEvent);
     if (session.writeOperation.hEvent) CloseHandle(session.writeOperation.hEvent);
+    if (session.hidModule) FreeLibrary(session.hidModule);
     ReleaseMutex(pollMutex);
     CloseHandle(pollMutex);
     return result;
@@ -476,8 +737,14 @@ static void ApplyResult(void) {
         AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L" мВ)");
     } else {
         AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used,
-            gResult.error == ERROR_NOT_FOUND ? L"свисток не найден"
+            gResult.cleanupFailed ? L"переподключи свисток: не завершён служебный режим"
+            : gResult.error == ERROR_NOT_FOUND ? L"свисток не найден; меню «Диагностика»"
+            : gResult.error == ERROR_NOT_SUPPORTED ? L"другой HID-интерфейс; меню «Диагностика»"
+            : gResult.error == ERROR_ACCESS_DENIED ? L"нет доступа к USB; меню «Диагностика»"
             : gResult.error == ERROR_BUSY ? L"идёт другой запрос" : L"нет ответа от наушников");
+        AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L" (код ");
+        AppendNumber(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, gResult.error);
+        AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L")");
     }
     ShellNotify(NIM_MODIFY);
     if (icon && previous) DestroyIcon(previous);
@@ -500,6 +767,7 @@ static void Refresh(void) {
 static void ExitWidget(HWND window) {
     gExiting = TRUE;
     KillTimer(window, TIMER_REFRESH);
+    KillTimer(window, TIMER_DEVICE_CHANGE);
     SetEvent(gCancel);
     if (!gWorker) DestroyWindow(window);
 }
@@ -510,6 +778,7 @@ static void ShowMenu(HWND window) {
     UINT command;
     if (!menu) return;
     AppendMenuW(menu, MF_STRING | (gWorker ? MF_GRAYED : 0), MENU_REFRESH, L"Обновить");
+    AppendMenuW(menu, MF_STRING, MENU_DIAGNOSTICS, L"Диагностика");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, MENU_EXIT, L"Выйти");
     GetCursorPos(&point);
@@ -533,6 +802,14 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
     case WM_TIMER:
         if (wParam == TIMER_REFRESH) Refresh();
+        else if (wParam == TIMER_DEVICE_CHANGE) { KillTimer(window, TIMER_DEVICE_CHANGE); Refresh(); }
+        return 0;
+    case WM_DEVICECHANGE:
+        /* Retry a previously missing dongle. Do not let bridge-induced device
+           notifications create a feedback loop of battery reads/audio drops. */
+        if (wParam == 7 && !gWorker && (gResult.error == ERROR_NOT_FOUND
+            || gResult.error == ERROR_NOT_SUPPORTED))
+            SetTimer(window, TIMER_DEVICE_CHANGE, 1500, NULL); /* DBT_DEVNODES_CHANGED */
         return 0;
     case WM_RESULT:
         if (gWorker) {
@@ -546,12 +823,14 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     case WM_COMMAND:
         if (LOWORD(wParam) == MENU_REFRESH) Refresh();
         else if (LOWORD(wParam) == MENU_EXIT) ExitWidget(window);
+        else if (LOWORD(wParam) == MENU_DIAGNOSTICS) SaveDiagnosticReport();
         return 0;
     case WM_CLOSE:
         ExitWidget(window);
         return 0;
     case WM_DESTROY:
         KillTimer(window, TIMER_REFRESH);
+        KillTimer(window, TIMER_DEVICE_CHANGE);
         ShellNotify(NIM_DELETE);
         if (gIcon) { DestroyIcon(gIcon); gIcon = NULL; }
         PostQuitMessage(0);
@@ -583,8 +862,8 @@ static BOOL HasArgument(const WCHAR *argument) {
 }
 
 static BOOL WriteConsoleText(const WCHAR *text) {
-    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    CHAR bytes[256];
+    HANDLE output = gDiagnosticOutput ? gDiagnosticOutput : GetStdHandle(STD_OUTPUT_HANDLE);
+    CHAR bytes[1024];
     DWORD written;
     int length;
     if (!output || output == INVALID_HANDLE_VALUE) {
@@ -593,6 +872,65 @@ static BOOL WriteConsoleText(const WCHAR *text) {
     }
     length = WideCharToMultiByte(CP_UTF8, 0, text, -1, bytes, sizeof(bytes), NULL, NULL);
     return length > 0 && WriteFile(output, bytes, (DWORD)(length - 1), &written, NULL);
+}
+
+static DWORD PrintDiagnostics(void) {
+    WriteConsoleText(L"G435 Battery Widget " APP_VERSION L"\r\n"
+#ifdef _WIN64
+        L"Architecture: x64\r\n"
+#else
+        L"Architecture: x86\r\n"
+#endif
+        L"Supported LIGHTSPEED dongles: 046D:0ADF (CRC64), 046D:0ACB (BRIDGE6).\r\n"
+        L"Read-only metadata scan: no battery/session commands are sent.\r\n"
+        L"Serial numbers and device paths are not included.\r\n\r\n");
+    ScanDongles(NULL, TRUE);
+    WriteConsoleText(L"\r\nIf an unknown G435 control interface is listed, share this report.\r\n"
+        L"For 0ACB, a normal battery read briefly interrupts audio.\r\n");
+    return 0;
+}
+
+static DWORD SaveDiagnosticReport(void) {
+    WCHAR path[MAX_PATH], notepad[MAX_PATH], command[2 * MAX_PATH + 8];
+    DWORD length = GetModuleFileNameW(NULL, path, ARRAYSIZE(path));
+    UINT used;
+    HANDLE file;
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    if (!length || length >= ARRAYSIZE(path)) return 1;
+    while (length && path[length - 1] != L'\\' && path[length - 1] != L'/') --length;
+    if (length + 21 >= ARRAYSIZE(path)) return 1;
+    used = length;
+    AppendWide(path, ARRAYSIZE(path), &used, L"G435-diagnostics.txt");
+    file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        MessageBoxW(gWindow, L"Не удалось сохранить отчёт. Распакуй виджет в папку с доступом на запись.",
+                    L"G435: диагностика", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    gDiagnosticOutput = file;
+    PrintDiagnostics();
+    gDiagnosticOutput = NULL;
+    CloseHandle(file);
+    length = GetSystemDirectoryW(notepad, ARRAYSIZE(notepad));
+    if (!length || length + 13 >= ARRAYSIZE(notepad)) return 0;
+    used = length;
+    AppendWide(notepad, ARRAYSIZE(notepad), &used, L"\\notepad.exe");
+    used = 0;
+    AppendWide(command, ARRAYSIZE(command), &used, L"\"");
+    AppendWide(command, ARRAYSIZE(command), &used, notepad);
+    AppendWide(command, ARRAYSIZE(command), &used, L"\" \"");
+    AppendWide(command, ARRAYSIZE(command), &used, path);
+    AppendWide(command, ARRAYSIZE(command), &used, L"\"");
+    ZeroBytes(&startup, sizeof(startup));
+    ZeroBytes(&process, sizeof(process));
+    startup.cb = sizeof(startup);
+    if (CreateProcessW(notepad, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    return 0;
 }
 
 static DWORD PrintReading(void) {
@@ -605,7 +943,18 @@ static DWORD PrintReading(void) {
         AppendNumber(text, ARRAYSIZE(text), &used, (DWORD)MillivoltsToPercent(result.millivolts));
         AppendWide(text, ARRAYSIZE(text), &used, json ? L",\"millivolts\":" : L"% (");
         AppendNumber(text, ARRAYSIZE(text), &used, (DWORD)result.millivolts);
-        AppendWide(text, ARRAYSIZE(text), &used, json ? L"}\r\n" : L" mV)\r\n");
+        if (json) {
+            AppendWide(text, ARRAYSIZE(text), &used, L",\"transport\":\"");
+            AppendWide(text, ARRAYSIZE(text), &used,
+                result.transport == G435_TRANSPORT_BRIDGE6 ? L"BRIDGE6" : L"CRC64");
+            AppendWide(text, ARRAYSIZE(text), &used, L"\"}\r\n");
+        } else AppendWide(text, ARRAYSIZE(text), &used, L" mV)\r\n");
+    } else if (json) {
+        AppendWide(text, ARRAYSIZE(text), &used, L"{\"error\":");
+        AppendNumber(text, ARRAYSIZE(text), &used, result.error);
+        AppendWide(text, ARRAYSIZE(text), &used, L",\"cleanup_failed\":");
+        AppendWide(text, ARRAYSIZE(text), &used, result.cleanupFailed ? L"true" : L"false");
+        AppendWide(text, ARRAYSIZE(text), &used, L"}\r\n");
     } else {
         AppendWide(text, ARRAYSIZE(text), &used, L"G435: battery read failed (Windows error ");
         AppendNumber(text, ARRAYSIZE(text), &used, result.error);
@@ -622,6 +971,8 @@ static DWORD RunWidget(void) {
     int status;
     DWORD exitCode = 0;
     UINT used = 0;
+    if (HasArgument(L"--diagnose")) return PrintDiagnostics();
+    if (HasArgument(L"--report")) return SaveDiagnosticReport();
     if (HasArgument(L"--quit") || HasArgument(L"--refresh")) {
         HWND existing = FindWindowW(kWindowClass, L"G435 Battery Widget");
         if (existing) PostMessageW(existing, HasArgument(L"--quit") ? WM_CLOSE : WM_REFRESH, 0, 0);

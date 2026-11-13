@@ -5,6 +5,7 @@ build/
 *.ilk
 *.user
 *.suo
+G435-diagnostics.txt
 
 # Local prototypes, preserved while publishing the current C / Win32 version.
 native/G435BatteryTray.cpp

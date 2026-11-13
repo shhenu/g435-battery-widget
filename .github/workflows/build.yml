@@ -26,6 +26,10 @@ jobs:
           Get-Item dist/G435BatteryTrayNative.exe | Select-Object Name, Length
           Get-FileHash dist/G435BatteryTrayNative.exe -Algorithm SHA256
 
+      - name: Check both G435 protocols without hardware
+        shell: cmd
+        run: test-protocol.bat
+
       - name: Upload Windows x64 build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -36,3 +40,4 @@ jobs:
             README.md
             LICENSE
             THIRD_PARTY_NOTICES.md
+            Diagnose-G435.bat

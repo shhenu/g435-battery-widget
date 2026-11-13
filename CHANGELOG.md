@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-11-13
+
+- Fix false 0ADF battery timeouts when opaque PI header counters are nonzero.
+- Parse and validate the complete OTA reply instead of requiring a zero byte
+  immediately before its length field.
+- Add the captured failing 4122 mV reply and header, padding, truncation, status,
+  and sequence regression checks.
+- Confirm the fix with a real headset reading: 4125 mV / estimated 93%.
+
 ## 0.2.0 — 2026-11-13
 
 - Add the Realtek/HDT647 `046D:0ACB` bridge protocol alongside `046D:0ADF`.

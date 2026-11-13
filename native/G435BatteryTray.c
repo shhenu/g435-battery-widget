@@ -19,7 +19,7 @@
 #define MENU_EXIT 1002
 #define MENU_DIAGNOSTICS 1003
 #define TIMER_DEVICE_CHANGE 2
-#define APP_VERSION L"0.2.0"
+#define APP_VERSION L"0.2.1"
 #define POLL_INTERVAL (15UL * 60UL * 1000UL)
 #define HID_REPORT_SIZE 65
 
@@ -220,15 +220,7 @@ static BOOL WritePacket(HID_SESSION *session, const BYTE *packet, DWORD length,
 }
 
 static int ParseMillivolts(const BYTE *packet, DWORD length) {
-    DWORD i;
-    for (i = 0; i + 7 < length; ++i) {
-        if (packet[i] == 0 && packet[i + 1] == 7 && packet[i + 2] == 0
-            && packet[i + 3] == 6 && packet[i + 5] == 0) {
-            int mv = packet[i + 6] | ((int)packet[i + 7] << 8);
-            if (mv >= 2500 && mv <= 4500) return mv;
-        }
-    }
-    return -1;
+    return G435ParseBatteryReport(packet, length);
 }
 
 static BOOL CollectReports(HID_SESSION *session, DWORD milliseconds, int *millivolts) {

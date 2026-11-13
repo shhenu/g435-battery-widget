@@ -38,6 +38,24 @@ typedef struct {
     unsigned long error;
 } G435_BRIDGE_RESULT;
 
+/* PI header bytes 4..7 are opaque counters/timestamps and may contain any value.
+   Locate and validate the complete OTA reply instead of matching a preceding 00. */
+static int G435ParseBatteryReport(const G435_BYTE *bytes, G435_UINT length) {
+    G435_UINT offset;
+    for (offset = 0; offset + 15 <= length; ++offset) {
+        const G435_BYTE *frame = bytes + offset;
+        G435_UINT payloadLength;
+        int millivolts;
+        if (frame[0] != 0x50 || frame[1] != 0x49 || (frame[2] != 1 && frame[2] != 6)) continue;
+        payloadLength = frame[8] + ((G435_UINT)frame[9] << 8);
+        if (payloadLength < 5 || payloadLength > length - offset - 10) continue;
+        if (frame[10] != 6 || !(frame[11] & 0x80) || frame[12] != 0) continue;
+        millivolts = frame[13] | ((int)frame[14] << 8);
+        if (millivolts >= 2500 && millivolts <= 4500) return millivolts;
+    }
+    return -1;
+}
+
 static void G435Copy(volatile G435_BYTE *out, const G435_BYTE *in, G435_UINT count) {
     while (count--) *out++ = *in++;
 }

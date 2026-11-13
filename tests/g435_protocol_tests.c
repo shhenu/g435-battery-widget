@@ -60,6 +60,31 @@ static void TestCapturedPackets(void) {
     CHECK(!G435IsBridgeAck(wrongAck,2) && !G435IsBridgeAck(ack,1));
 }
 
+static void TestNonzeroHeaderCounter(void) {
+    /* Actual 0ADF reply that v0.2.0 silently discarded: counter high byte = 01. */
+    const unsigned char capture[] = {0x11,0x50,0x49,1,0xf7,0x04,0x2a,0x61,1,
+                                    7,0,6,0x85,0,0x1a,0x10,0,0};
+    unsigned char report[64], withReportId[65];
+    unsigned i;
+    memset(report,0,sizeof(report));
+    memcpy(report,capture,sizeof(capture));
+    CHECK(G435ParseBatteryReport(report,sizeof(report)) == 4122);
+    for (i = 5; i <= 8; ++i) report[i] = 0xff;
+    CHECK(G435ParseBatteryReport(report,sizeof(report)) == 4122);
+    withReportId[0] = 0;
+    memcpy(withReportId+1,report,sizeof(report));
+    CHECK(G435ParseBatteryReport(withReportId,sizeof(withReportId)) == 4122);
+    CHECK(G435ParseBatteryReport(capture,sizeof(capture)-1) == -1);
+    CHECK(G435ParseBatteryReport(report,14) == -1);
+    report[13] = 1;
+    CHECK(G435ParseBatteryReport(report,sizeof(report)) == -1);
+    report[13] = 0; report[12] = 5;
+    CHECK(G435ParseBatteryReport(report,sizeof(report)) == -1);
+    report[12] = 0x85; report[9] = 255; report[10] = 255;
+    CHECK(G435ParseBatteryReport(report,sizeof(report)) == -1);
+    CHECK(G435ParseBatteryReport(kBattery,sizeof(kBattery)) == 3930);
+}
+
 static void TestReplyParser(void) {
     G435_PI_PARSER parser;
     unsigned char feature[64], service[40], malformed[40], wrongStatus[sizeof(kBattery)];
@@ -201,6 +226,7 @@ static void TestBridgeCleanup(void) {
 int main(void) {
     TestDiscovery();
     TestCapturedPackets();
+    TestNonzeroHeaderCounter();
     TestReplyParser();
     TestBridgeCleanup();
     if (failures) { printf("%d protocol checks failed\n", failures); return 1; }

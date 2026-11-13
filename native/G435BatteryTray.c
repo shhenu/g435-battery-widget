@@ -9,6 +9,7 @@
 #include <cfgmgr32.h>
 #include <hidsdi.h>
 #include <hidpi.h>
+#include <dbt.h>
 #include "g435_protocol.h"
 
 #define WM_TRAY (WM_APP + 1)
@@ -18,21 +19,16 @@
 #define MENU_REFRESH 1001
 #define MENU_EXIT 1002
 #define MENU_DIAGNOSTICS 1003
+#define MENU_ABOUT 1004
 #define TIMER_DEVICE_CHANGE 2
-#define APP_VERSION L"0.2.1"
+#define APP_VERSION L"0.3.0"
 #define POLL_INTERVAL (15UL * 60UL * 1000UL)
 #define HID_REPORT_SIZE 65
 
 /* Retain the compiler's stack-cookie checks without the CRT startup. */
 void __cdecl __security_init_cookie(void);
 
-typedef struct {
-    BOOL ok;
-    int millivolts;
-    DWORD error;
-    int transport;
-    BOOL cleanupFailed;
-} BATTERY_RESULT;
+typedef G435_READING BATTERY_RESULT;
 
 typedef CONFIGRET (WINAPI *CM_LIST_SIZE_FN)(PULONG, LPGUID, DEVINSTID_W, ULONG);
 typedef CONFIGRET (WINAPI *CM_LIST_FN)(LPGUID, DEVINSTID_W, PZZWSTR, ULONG, ULONG);
@@ -53,6 +49,7 @@ typedef struct {
     BOOL readPending;
     BOOL sessionStarted;
     BYTE sequence;
+    BYTE lastSequence;
     WORD inputLength;
     WORD outputLength;
     int transport;
@@ -74,6 +71,10 @@ static HICON gIcon;
 static NOTIFYICONDATAW gNotify;
 static HANDLE gCancel;
 static HANDLE gWorker;
+static HDEVNOTIFY gDeviceNotifications;
+static UINT gConsecutiveFailures;
+static UINT gNextPollDelay = POLL_INTERVAL;
+static BOOL gPendingDeviceChange;
 static BOOL gExiting;
 static UINT gTaskbarCreated;
 static BATTERY_RESULT gResult;
@@ -219,10 +220,6 @@ static BOOL WritePacket(HID_SESSION *session, const BYTE *packet, DWORD length,
     return TRUE;
 }
 
-static int ParseMillivolts(const BYTE *packet, DWORD length) {
-    return G435ParseBatteryReport(packet, length);
-}
-
 static BOOL CollectReports(HID_SESSION *session, DWORD milliseconds, int *millivolts) {
     DWORD started = GetTickCount();
     HANDLE events[2];
@@ -240,9 +237,11 @@ static BOOL CollectReports(HID_SESSION *session, DWORD milliseconds, int *milliv
         session->readPending = FALSE;
         if (millivolts) {
             int value = -1;
-            if (transferred == 65) value = ParseMillivolts(session->input + 1, 64);
-            else if (transferred == 64) value = ParseMillivolts(session->input, 64);
-            if (value >= 0) *millivolts = value;
+            if (transferred == 65)
+                value = G435ParseBatteryForSequence(session->input + 1, 64, session->lastSequence);
+            else if (transferred == 64)
+                value = G435ParseBatteryForSequence(session->input, 64, session->lastSequence);
+            if (value >= 0) { *millivolts = value; return TRUE; }
         }
         if (!BeginRead(session)) return FALSE;
     }
@@ -265,6 +264,7 @@ static BOOL SendPa(HID_SESSION *session, BYTE category, BYTE lengthField,
     body[1] = 0x41;
     body[2] = category;
     body[3] = session->sequence;
+    session->lastSequence = session->sequence;
     body[4] = lengthField;
     session->sequence = (BYTE)((session->sequence % 127) + 1);
     CopyBytes(body + 5, payload, length);
@@ -300,7 +300,7 @@ static void ReportInterface(const HIDD_ATTRIBUTES *attr, const HIDP_CAPS *caps,
 }
 
 /* Diagnostics uses metadata-only handles and never sends device commands. */
-static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose) {
+static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose, UINT candidateIndex) {
     HMODULE config = NULL, hid = NULL;
     CM_LIST_SIZE_FN listSize;
     CM_LIST_FN list;
@@ -369,42 +369,41 @@ static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose) {
                     HIDD_ATTRIBUTES attr;
                     PHIDP_PREPARSED_DATA data = NULL;
                     HIDP_CAPS caps;
-                    WCHAR product[96];
+                    WCHAR product[128];
                     int transport = G435_TRANSPORT_NONE;
                     ZeroBytes(&attr, sizeof(attr));
                     ZeroBytes(&caps, sizeof(caps));
                     ZeroBytes(product, sizeof(product));
                     attr.Size = sizeof(attr);
                     if (attributes(probe, &attr)) {
-                        if (getProduct && (diagnose || (attr.VendorID == 0x046d
-                            && attr.ProductID != 0x0adf && attr.ProductID != 0x0acb)))
+                        if (getProduct)
                             getProduct(probe, product, sizeof(product));
                         product[ARRAYSIZE(product) - 1] = 0;
                         if (preparsed(probe, &data)) {
                             if (capabilities(data, &caps) == HIDP_STATUS_SUCCESS)
-                                transport = G435SelectTransport(attr.VendorID, attr.ProductID,
+                                transport = G435SelectNamedTransport(attr.VendorID, attr.ProductID,
                                     caps.UsagePage, caps.InputReportByteLength,
-                                    caps.OutputReportByteLength, caps.FeatureReportByteLength);
+                                    caps.OutputReportByteLength, caps.FeatureReportByteLength, product);
                             freePreparsed(data);
                         }
                         if (attr.VendorID == 0x046d || ContainsAscii(product, L"G435")) {
                             ++seen;
                             if (diagnose) ReportInterface(&attr, &caps, product, transport);
                         }
-                        if (ContainsAscii(product, L"G435") || (attr.VendorID == 0x046d
+                        if (G435IsModelName(product) || (attr.VendorID == 0x046d
                             && (attr.ProductID == 0x0adf || attr.ProductID == 0x0acb))) knownProduct = TRUE;
                         if (transport != G435_TRANSPORT_NONE) {
                             ++supported;
-                            if (!diagnose) {
+                            if (!diagnose && supported - 1 == candidateIndex) {
                                 CloseHandle(probe);
                                 probe = INVALID_HANDLE_VALUE;
+                                session->inputLength = caps.InputReportByteLength;
+                                session->outputLength = caps.OutputReportByteLength;
+                                session->transport = transport;
                                 device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                                     FILE_FLAG_OVERLAPPED, NULL);
                                 if (device != INVALID_HANDLE_VALUE) {
-                                    session->inputLength = caps.InputReportByteLength;
-                                    session->outputLength = caps.OutputReportByteLength;
-                                    session->transport = transport;
                                     session->feature = getFeature;
                                     session->setFeature = setFeature;
                                     session->hidModule = hid;
@@ -412,6 +411,7 @@ static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose) {
                                     break;
                                 }
                                 openError = GetLastError();
+                                break;
                             }
                         }
                     }
@@ -424,6 +424,7 @@ static HANDLE ScanDongles(HID_SESSION *session, BOOL diagnose) {
     }
     if (status != CR_SUCCESS) error = ERROR_GEN_FAILURE;
     else if (openError) error = openError;
+    else if (supported && candidateIndex >= supported) error = ERROR_NO_MORE_ITEMS;
     else if (knownProduct) error = ERROR_NOT_SUPPORTED;
 done:
     if (paths) HeapFree(GetProcessHeap(), 0, paths);
@@ -555,7 +556,7 @@ static unsigned long BridgeError(void *context) {
     return GetLastError();
 }
 
-static BATTERY_RESULT ReadBattery(void) {
+static BATTERY_RESULT ReadCandidate(UINT candidateIndex) {
     static const BYTE enable[] = {1};
     static const BYTE disable[] = {2};
     static const BYTE init[] = {0x50, 0x41, 0x06, 0x01, 0x0d, 0x00, 0x25,
@@ -565,25 +566,14 @@ static BATTERY_RESULT ReadBattery(void) {
     static const BYTE battery[] = {0, 0x31};
     HID_SESSION session;
     BATTERY_RESULT result;
-    HANDLE pollMutex;
-    DWORD wait;
 
     ZeroBytes(&session, sizeof(session));
     ZeroBytes(&result, sizeof(result));
     result.millivolts = -1;
     session.device = INVALID_HANDLE_VALUE;
-    pollMutex = CreateMutexW(NULL, FALSE, kPollMutex);
-    if (!pollMutex) { result.error = GetLastError(); return result; }
-    wait = WaitForSingleObject(pollMutex, 0);
-    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
-        result.error = ERROR_BUSY;
-        CloseHandle(pollMutex);
-        return result;
-    }
-
-    session.device = ScanDongles(&session, FALSE);
-    if (session.device == INVALID_HANDLE_VALUE) { result.error = GetLastError(); goto done; }
+    session.device = ScanDongles(&session, FALSE, candidateIndex);
     result.transport = session.transport;
+    if (session.device == INVALID_HANDLE_VALUE) { result.error = GetLastError(); goto done; }
     session.readOperation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     session.writeOperation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!session.readOperation.hEvent || !session.writeOperation.hEvent || !BeginRead(&session)) {
@@ -618,15 +608,16 @@ static BATTERY_RESULT ReadBattery(void) {
         goto done;
     }
     session.sequence = 1;
-    if (!Transact(&session, 0x84, enable, 1, 50, NULL)) goto io_error;
+    /* An entry write may reach the dongle even if its following read fails. */
     session.sessionStarted = TRUE;
+    if (!Transact(&session, 0x84, enable, 1, 50, NULL)) goto io_error;
     if (!Transact(&session, 0x85, enable, 1, 50, NULL)
         || !Transact(&session, 0x80, init, sizeof(init), 450, NULL)) goto io_error;
     session.sequence = 2;
     if (!SendPa(&session, 0x0e, 1, getMode, 1, 120, NULL)
         || !SendPa(&session, 0x0e, 2, setMode, 2, 120, NULL)
         || !SendPa(&session, 0x0e, 1, getMode, 1, 120, NULL)
-        || !SendPa(&session, 0x06, 1, battery, 2, 250, &result.millivolts)) goto io_error;
+        || !SendPa(&session, 0x06, 1, battery, 2, 1000, &result.millivolts)) goto io_error;
     result.ok = result.millivolts >= 0;
     if (!result.ok) result.error = ERROR_TIMEOUT;
     goto done;
@@ -638,7 +629,11 @@ done:
             BYTE output[HID_REPORT_SIZE];
             MakeFrame(output, 0x85, disable, 1);
             /* End the session even when a request was cancelled or failed. */
-            WritePacket(&session, output, sizeof(output), FALSE);
+            if (!WritePacket(&session, output, sizeof(output), FALSE)) {
+                result.cleanupFailed = TRUE;
+                result.ok = FALSE;
+                if (!result.error) result.error = GetLastError();
+            }
         }
         if (session.readPending) CancelOperation(session.device, &session.readOperation);
         CloseHandle(session.device);
@@ -646,6 +641,39 @@ done:
     if (session.readOperation.hEvent) CloseHandle(session.readOperation.hEvent);
     if (session.writeOperation.hEvent) CloseHandle(session.writeOperation.hEvent);
     if (session.hidModule) FreeLibrary(session.hidModule);
+    return result;
+}
+
+static G435_READING ReadCandidateAdapter(void *context, G435_UINT index) {
+    UNREFERENCED_PARAMETER(context);
+    return ReadCandidate(index);
+}
+
+static int ReadCancelledAdapter(void *context) {
+    UNREFERENCED_PARAMETER(context);
+    return IsCancelled();
+}
+
+static BATTERY_RESULT ReadBattery(void) {
+    BATTERY_RESULT result;
+    HANDLE pollMutex;
+    DWORD wait;
+    G435_READER_IO io;
+    ZeroBytes(&result, sizeof(result));
+    result.millivolts = -1;
+    pollMutex = CreateMutexW(NULL, FALSE, kPollMutex);
+    if (!pollMutex) { result.error = GetLastError(); return result; }
+    wait = WaitForSingleObject(pollMutex, 0);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+        result.error = ERROR_BUSY;
+        CloseHandle(pollMutex);
+        return result;
+    }
+    io.context = NULL;
+    io.candidate = ReadCandidateAdapter;
+    io.cancelled = ReadCancelledAdapter;
+    result = G435ReadAvailable(&io);
+    if (IsCancelled() && !result.error) result.error = ERROR_CANCELLED;
     ReleaseMutex(pollMutex);
     CloseHandle(pollMutex);
     return result;
@@ -714,6 +742,14 @@ static HICON MakeBatteryIcon(int percent) {
     return icon ? icon : CopyIcon(LoadIconW(NULL, IDI_APPLICATION));
 }
 
+static void ScheduleNextPoll(void) {
+    if (gResult.ok) gConsecutiveFailures = 0;
+    else if (gConsecutiveFailures < 3) ++gConsecutiveFailures;
+    gNextPollDelay = G435NextPollDelay(gResult.ok, gResult.cleanupFailed, gConsecutiveFailures);
+    KillTimer(gWindow, TIMER_REFRESH);
+    if (gNextPollDelay) SetTimer(gWindow, TIMER_REFRESH, gNextPollDelay, NULL);
+}
+
 static void ApplyResult(void) {
     UINT used = 0;
     int percent = gResult.ok ? MillivoltsToPercent(gResult.millivolts) : -1;
@@ -729,14 +765,17 @@ static void ApplyResult(void) {
         AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L" мВ)");
     } else {
         AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used,
-            gResult.cleanupFailed ? L"переподключи свисток: не завершён служебный режим"
-            : gResult.error == ERROR_NOT_FOUND ? L"свисток не найден; меню «Диагностика»"
-            : gResult.error == ERROR_NOT_SUPPORTED ? L"другой HID-интерфейс; меню «Диагностика»"
-            : gResult.error == ERROR_ACCESS_DENIED ? L"нет доступа к USB; меню «Диагностика»"
-            : gResult.error == ERROR_BUSY ? L"идёт другой запрос" : L"нет ответа от наушников");
-        AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L" (код ");
-        AppendNumber(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, gResult.error);
-        AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L")");
+            gResult.cleanupFailed ? L"переподключите USB-свисток"
+            : gResult.error == ERROR_NOT_FOUND ? L"ожидание USB-свистка"
+            : gResult.error == ERROR_NOT_SUPPORTED ? L"интерфейс этой ревизии не поддерживается"
+            : gResult.error == ERROR_ACCESS_DENIED ? L"USB недоступен; закройте другие утилиты G435"
+            : gResult.error == ERROR_BUSY ? L"ожидание завершения другого запроса"
+            : L"ожидание ответа; включите наушники в LIGHTSPEED");
+        if (gNextPollDelay) {
+            AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L". Повтор через ");
+            AppendNumber(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, gNextPollDelay / 1000);
+            AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L" с");
+        }
     }
     ShellNotify(NIM_MODIFY);
     if (icon && previous) DestroyIcon(previous);
@@ -751,9 +790,16 @@ static DWORD WINAPI ReadWorker(void *unused) {
 
 static void Refresh(void) {
     if (gWorker || gExiting) return;
+    KillTimer(gWindow, TIMER_REFRESH);
     ResetEvent(gCancel);
     gWorker = CreateThread(NULL, 64 * 1024, ReadWorker, NULL,
                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!gWorker) {
+        ZeroBytes(&gResult, sizeof(gResult));
+        gResult.error = GetLastError();
+        ScheduleNextPoll();
+        ApplyResult();
+    }
 }
 
 static void ExitWidget(HWND window) {
@@ -764,6 +810,29 @@ static void ExitWidget(HWND window) {
     if (!gWorker) DestroyWindow(window);
 }
 
+static void ShowAbout(HWND window) {
+    MessageBoxW(window, L"G435 Battery Widget " APP_VERSION L"\n"
+        L"Автоматическое определение Logitech G435 LIGHTSPEED.\n\n"
+        L"MIT License\n"
+        L"Copyright (c) 2026 shhenu\n"
+        L"0ADF protocol: Copyright (c) 2026 Oğuz Kayra Bozkurt\n\n"
+        L"Permission is hereby granted, free of charge, to any person obtaining a copy "
+        L"of this software and associated documentation files (the \"Software\"), to deal "
+        L"in the Software without restriction, including without limitation the rights "
+        L"to use, copy, modify, merge, publish, distribute, sublicense, and/or sell "
+        L"copies of the Software, and to permit persons to whom the Software is "
+        L"furnished to do so, subject to the following conditions:\n\n"
+        L"The above copyright notice and this permission notice shall be included in all "
+        L"copies or substantial portions of the Software.\n\n"
+        L"THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR "
+        L"IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, "
+        L"FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE "
+        L"AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER "
+        L"LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, "
+        L"OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.",
+        L"О программе G435 Battery Widget", MB_OK | MB_ICONINFORMATION);
+}
+
 static void ShowMenu(HWND window) {
     HMENU menu = CreatePopupMenu();
     POINT point;
@@ -771,6 +840,7 @@ static void ShowMenu(HWND window) {
     if (!menu) return;
     AppendMenuW(menu, MF_STRING | (gWorker ? MF_GRAYED : 0), MENU_REFRESH, L"Обновить");
     AppendMenuW(menu, MF_STRING, MENU_DIAGNOSTICS, L"Диагностика");
+    AppendMenuW(menu, MF_STRING, MENU_ABOUT, L"О программе");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, MENU_EXIT, L"Выйти");
     GetCursorPos(&point);
@@ -797,12 +867,44 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         else if (wParam == TIMER_DEVICE_CHANGE) { KillTimer(window, TIMER_DEVICE_CHANGE); Refresh(); }
         return 0;
     case WM_DEVICECHANGE:
-        /* Retry a previously missing dongle. Do not let bridge-induced device
-           notifications create a feedback loop of battery reads/audio drops. */
-        if (wParam == 7 && !gWorker && (gResult.error == ERROR_NOT_FOUND
+        if ((wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) && lParam) {
+            const DEV_BROADCAST_HDR *header = (const DEV_BROADCAST_HDR *)lParam;
+            if (header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE
+                && header->dbch_size >= sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)) {
+                const DEV_BROADCAST_DEVICEINTERFACE_W *change =
+                    (const DEV_BROADCAST_DEVICEINTERFACE_W *)lParam;
+                WCHAR name[512];
+                DWORD characters = (header->dbch_size
+                    - FIELD_OFFSET(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) / sizeof(WCHAR);
+                if (characters >= ARRAYSIZE(name)) characters = ARRAYSIZE(name) - 1;
+                CopyBytes(name, change->dbcc_name, characters * sizeof(WCHAR));
+                name[characters] = 0;
+                if (ContainsAscii(name, L"vid_046d")) {
+                    if (gWorker) gPendingDeviceChange = TRUE;
+                    else {
+                        gConsecutiveFailures = 0;
+                        KillTimer(window, TIMER_REFRESH);
+                        SetTimer(window, TIMER_DEVICE_CHANGE, 1500, NULL);
+                    }
+                }
+            }
+        }
+        /* Generic node notifications may be caused by the bridge itself; use
+           them only to recover an already missing/unsupported device. */
+        else if (wParam == DBT_DEVNODES_CHANGED && !gWorker && (gResult.error == ERROR_NOT_FOUND
             || gResult.error == ERROR_NOT_SUPPORTED))
-            SetTimer(window, TIMER_DEVICE_CHANGE, 1500, NULL); /* DBT_DEVNODES_CHANGED */
+            SetTimer(window, TIMER_DEVICE_CHANGE, 1500, NULL);
         return 0;
+    case WM_POWERBROADCAST:
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            if (gWorker) gPendingDeviceChange = TRUE;
+            else {
+                gConsecutiveFailures = 0;
+                KillTimer(window, TIMER_REFRESH);
+                SetTimer(window, TIMER_DEVICE_CHANGE, 2500, NULL);
+            }
+        }
+        return TRUE;
     case WM_RESULT:
         if (gWorker) {
             WaitForSingleObject(gWorker, INFINITE);
@@ -810,12 +912,25 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
             gWorker = NULL;
         }
         if (gExiting) DestroyWindow(window);
-        else ApplyResult();
+        else {
+            ScheduleNextPoll();
+            ApplyResult();
+            if (gPendingDeviceChange) {
+                gPendingDeviceChange = FALSE;
+                /* A successful read is already current. Avoid another read if
+                   entering/exiting the bridge caused its own HID notification. */
+                if (!gResult.ok && !gResult.cleanupFailed) {
+                    gConsecutiveFailures = 0;
+                    SetTimer(window, TIMER_DEVICE_CHANGE, 1500, NULL);
+                }
+            }
+        }
         return 0;
     case WM_COMMAND:
         if (LOWORD(wParam) == MENU_REFRESH) Refresh();
         else if (LOWORD(wParam) == MENU_EXIT) ExitWidget(window);
         else if (LOWORD(wParam) == MENU_DIAGNOSTICS) SaveDiagnosticReport();
+        else if (LOWORD(wParam) == MENU_ABOUT) ShowAbout(window);
         return 0;
     case WM_CLOSE:
         ExitWidget(window);
@@ -823,6 +938,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     case WM_DESTROY:
         KillTimer(window, TIMER_REFRESH);
         KillTimer(window, TIMER_DEVICE_CHANGE);
+        if (gDeviceNotifications) UnregisterDeviceNotification(gDeviceNotifications);
         ShellNotify(NIM_DELETE);
         if (gIcon) { DestroyIcon(gIcon); gIcon = NULL; }
         PostQuitMessage(0);
@@ -873,11 +989,12 @@ static DWORD PrintDiagnostics(void) {
 #else
         L"Architecture: x86\r\n"
 #endif
-        L"Supported LIGHTSPEED dongles: 046D:0ADF (CRC64), 046D:0ACB (BRIDGE6).\r\n"
+        L"Automatic G435 profiles: CRC64 and Realtek BRIDGE6 (Feature 64 / Output 515).\r\n"
+        L"Known IDs and compatible Logitech G435/G435SE model + HID fingerprints are recognized.\r\n"
         L"Read-only metadata scan: no battery/session commands are sent.\r\n"
         L"Serial numbers and device paths are not included.\r\n\r\n");
-    ScanDongles(NULL, TRUE);
-    WriteConsoleText(L"\r\nIf an unknown G435 control interface is listed, share this report.\r\n"
+    ScanDongles(NULL, TRUE, 0);
+    WriteConsoleText(L"\r\nNormal use requires no USB-ID, settings or diagnostic report.\r\n"
         L"For 0ACB, a normal battery read briefly interrupts audio.\r\n");
     return 0;
 }
@@ -963,6 +1080,7 @@ static DWORD RunWidget(void) {
     int status;
     DWORD exitCode = 0;
     UINT used = 0;
+    DEV_BROADCAST_DEVICEINTERFACE_W notification;
     if (HasArgument(L"--diagnose")) return PrintDiagnostics();
     if (HasArgument(L"--report")) return SaveDiagnosticReport();
     if (HasArgument(L"--quit") || HasArgument(L"--refresh")) {
@@ -993,6 +1111,12 @@ static DWORD RunWidget(void) {
     gWindow = CreateWindowExW(0, kWindowClass, L"G435 Battery Widget",
         WS_OVERLAPPED, 0, 0, 1, 1, NULL, NULL, windowClass.hInstance, NULL);
     if (!gWindow) { exitCode = 1; goto done; }
+    ZeroBytes(&notification, sizeof(notification));
+    notification.dbcc_size = sizeof(notification);
+    notification.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    CopyBytes(&notification.dbcc_classguid, &kHidGuid, sizeof(kHidGuid));
+    gDeviceNotifications = RegisterDeviceNotificationW(gWindow, &notification,
+                                                       DEVICE_NOTIFY_WINDOW_HANDLE);
     gTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     gIcon = MakeBatteryIcon(-1);
     gNotify.cbSize = sizeof(gNotify);
@@ -1003,7 +1127,6 @@ static DWORD RunWidget(void) {
     gNotify.hIcon = gIcon;
     AppendWide(gNotify.szTip, ARRAYSIZE(gNotify.szTip), &used, L"G435: проверка заряда");
     ShellNotify(NIM_ADD);
-    SetTimer(gWindow, TIMER_REFRESH, POLL_INTERVAL, NULL);
     PostMessageW(gWindow, WM_REFRESH, 0, 0);
     while ((status = GetMessageW(&message, NULL, 0, 0)) > 0) {
         TranslateMessage(&message);

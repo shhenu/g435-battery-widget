@@ -35,6 +35,94 @@ static void TestDiscovery(void) {
     CHECK(G435SelectTransport(0x046d,0xffff,0xffc0,7,515,64) == G435_TRANSPORT_NONE);
 }
 
+static void TestAutomaticModelMatching(void) {
+    const unsigned short *g435 = (const unsigned short *)L"Logitech G435 Wireless Gaming Headset";
+    CHECK(G435IsModelName(g435));
+    CHECK(G435IsModelName((const unsigned short *)L"g435"));
+    CHECK(G435IsModelName((const unsigned short *)L"G435 SE"));
+    CHECK(G435IsModelName((const unsigned short *)L"Logitech G435SE Gaming Headset"));
+    CHECK(!G435IsModelName((const unsigned short *)L"G4350"));
+    CHECK(!G435IsModelName((const unsigned short *)L"G935 Gaming Headset"));
+    CHECK(!G435IsModelName((const unsigned short *)L"LogitechG435"));
+    CHECK(!G435IsModelName((const unsigned short *)L"G435S"));
+    CHECK(!G435IsModelName((const unsigned short *)L"G43"));
+    CHECK(!G435IsModelName((const unsigned short *)L"G"));
+    CHECK(!G435IsModelName(NULL));
+    /* Synthetic alternative IDs exercise matching without hardcoding a user's PID. */
+    CHECK(G435SelectNamedTransport(0x046d,0xabcd,0xff00,65,65,0,g435) == G435_TRANSPORT_CRC64);
+    CHECK(G435SelectNamedTransport(0x046d,0xabce,0xffc0,7,515,64,g435) == G435_TRANSPORT_BRIDGE6);
+    CHECK(G435SelectNamedTransport(0x046d,0xabce,0xffc0,7,0,64,g435) == G435_TRANSPORT_BRIDGE6);
+    CHECK(G435SelectNamedTransport(0x046d,0xabcd,0x000c,65,65,0,g435) == G435_TRANSPORT_NONE);
+    CHECK(G435SelectNamedTransport(0x046d,0xabcd,0xff00,64,65,0,g435) == G435_TRANSPORT_NONE);
+    CHECK(G435SelectNamedTransport(0x1234,0xabcd,0xff00,65,65,0,g435) == G435_TRANSPORT_NONE);
+    CHECK(G435SelectNamedTransport(0x046d,0xabcd,0xff00,65,65,0,
+        (const unsigned short *)L"G935") == G435_TRANSPORT_NONE);
+    CHECK(G435SelectNamedTransport(0x046d,0xabcd,0xff00,65,65,0,
+        (const unsigned short *)L"G4350") == G435_TRANSPORT_NONE);
+}
+
+static void TestAutomaticRetry(void) {
+    CHECK(G435NextPollDelay(1,0,0) == 900000);
+    CHECK(G435NextPollDelay(0,0,1) == 5000);
+    CHECK(G435NextPollDelay(0,0,2) == 15000);
+    CHECK(G435NextPollDelay(0,0,3) == 60000);
+    CHECK(G435NextPollDelay(0,0,100000) == 60000);
+    CHECK(G435NextPollDelay(0,1,1) == 0);
+    CHECK(G435NextPollDelay(1,1,0) == 0);
+}
+
+typedef struct {
+    G435_READING items[8];
+    unsigned calls;
+    unsigned cancelAfter;
+} FAKE_RECEIVERS;
+
+static G435_READING FakeCandidate(void *context, unsigned index) {
+    FAKE_RECEIVERS *fake = (FAKE_RECEIVERS *)context;
+    CHECK(index < 8);
+    ++fake->calls;
+    return fake->items[index];
+}
+
+static int FakeReaderCancelled(void *context) {
+    FAKE_RECEIVERS *fake = (FAKE_RECEIVERS *)context;
+    return fake->calls >= fake->cancelAfter;
+}
+
+static void TestReceiverFailover(void) {
+    FAKE_RECEIVERS fake;
+    G435_READER_IO io;
+    G435_READING result;
+    unsigned index;
+    memset(&fake,0,sizeof(fake));
+    fake.cancelAfter = 100;
+    io.context = &fake; io.candidate = FakeCandidate; io.cancelled = FakeReaderCancelled;
+    fake.items[0].transport = G435_TRANSPORT_CRC64;
+    fake.items[0].error = 1460;
+    fake.items[1].transport = G435_TRANSPORT_BRIDGE6;
+    fake.items[1].ok = 1; fake.items[1].millivolts = 3930;
+    result = G435ReadAvailable(&io);
+    CHECK(result.ok && result.millivolts == 3930 && fake.calls == 2);
+    fake.calls = 0; fake.items[0].cleanupFailed = 1;
+    result = G435ReadAvailable(&io);
+    CHECK(!result.ok && result.cleanupFailed && fake.calls == 1);
+    fake.calls = 0; fake.items[0].cleanupFailed = 0; fake.items[0].ok = 1;
+    result = G435ReadAvailable(&io);
+    CHECK(result.ok && fake.calls == 1);
+    fake.calls = 0; fake.items[0].ok = 0; fake.items[1].transport = G435_TRANSPORT_NONE;
+    result = G435ReadAvailable(&io);
+    CHECK(!result.ok && result.error == 1460 && fake.calls == 2);
+    fake.calls = 0; fake.cancelAfter = 0;
+    result = G435ReadAvailable(&io);
+    CHECK(!result.ok && fake.calls == 0);
+    fake.cancelAfter = 100;
+    for (index = 0; index < 8; ++index) {
+        fake.items[index].ok = 0; fake.items[index].transport = G435_TRANSPORT_CRC64;
+    }
+    result = G435ReadAvailable(&io);
+    CHECK(!result.ok && fake.calls == 8);
+}
+
 static void TestCapturedPackets(void) {
     unsigned char packet[515], oversize[256], feature[64];
     const unsigned char expectedMode[] = {6,4,3,6,0,0x50,0x41,0x0e,0,1,0xe0};
@@ -69,6 +157,8 @@ static void TestNonzeroHeaderCounter(void) {
     memset(report,0,sizeof(report));
     memcpy(report,capture,sizeof(capture));
     CHECK(G435ParseBatteryReport(report,sizeof(report)) == 4122);
+    CHECK(G435ParseBatteryForSequence(report,sizeof(report),5) == 4122);
+    CHECK(G435ParseBatteryForSequence(report,sizeof(report),4) == -1);
     for (i = 5; i <= 8; ++i) report[i] = 0xff;
     CHECK(G435ParseBatteryReport(report,sizeof(report)) == 4122);
     withReportId[0] = 0;
@@ -225,6 +315,9 @@ static void TestBridgeCleanup(void) {
 
 int main(void) {
     TestDiscovery();
+    TestAutomaticModelMatching();
+    TestAutomaticRetry();
+    TestReceiverFailover();
     TestCapturedPackets();
     TestNonzeroHeaderCounter();
     TestReplyParser();

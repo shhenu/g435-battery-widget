@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 — 2026-11-13
+
+- Distribute a standalone Windows x64 executable with embedded MIT notices.
+- Automatically select both known G435 LIGHTSPEED protocols without settings.
+- Recognize compatible alternative USB IDs only when the Logitech G435/G435SE
+  product identity and an implemented HID control-interface fingerprint match.
+- Try the next supported receiver when the first is unavailable or unresponsive;
+  stop on cancellation or unconfirmed session cleanup.
+- Retry unavailable headsets after 5, 15, then 60 seconds; retain the 15-minute
+  interval after a successful read and pause automatic polling on cleanup failure.
+- Refresh after Logitech HID arrival/removal and Windows resume, with debouncing
+  and no follow-up read for successful requests' own device notifications.
+- Accept slower CRC64 battery replies, match the outstanding request sequence,
+  and finish immediately after a valid answer.
+- Attempt CRC64 session exit even if the read following an entry write fails.
+- Add model-matching, receiver-failover, retry-policy, and sequence tests.
+- Confirm a real 0ADF read: 4035 mV / estimated 84%; the idle widget remains about
+  6 MB working set and 1.05 MB private memory, with one thread and a 30 KiB file.
+
+0ACB remains covered by recorded packets and failure-injection tests. No physical
+0ACB dongle was available; future incompatible protocols and Bluetooth are outside
+this release's supported scope.
+
 ## 0.2.1 — 2026-11-13
 
 - Fix false 0ADF battery timeouts when opaque PI header counters are nonzero.

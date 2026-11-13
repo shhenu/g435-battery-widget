@@ -1,0 +1,12 @@
+dist/
+build/
+*.obj
+*.pdb
+*.ilk
+*.user
+*.suo
+
+# Local prototypes, preserved while publishing the current C / Win32 version.
+native/G435BatteryTray.cpp
+src/
+build.bat

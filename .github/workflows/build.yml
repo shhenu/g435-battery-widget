@@ -1,0 +1,38 @@
+name: Build Windows widget
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build native Windows x64 widget
+        shell: cmd
+        run: build-native.bat
+
+      - name: Show binary size and checksum
+        shell: pwsh
+        run: |
+          Get-Item dist/G435BatteryTrayNative.exe | Select-Object Name, Length
+          Get-FileHash dist/G435BatteryTrayNative.exe -Algorithm SHA256
+
+      - name: Upload Windows x64 build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: G435BatteryWidget-windows-x64
+          if-no-files-found: error
+          path: |
+            dist/G435BatteryTrayNative.exe
+            README.md
+            LICENSE
+            THIRD_PARTY_NOTICES.md
